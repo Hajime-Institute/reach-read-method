@@ -443,13 +443,33 @@ def check(data_dir):
 def score(run_path, data_dir, out_path=None, n_boot=2000, seed=0):
     """RAG の実行記録を、六つのマスと「まず直す場所」にまとめる。
 
-    実行記録は 1 行 1 問の JSON Lines。欄は id・chunks（回答モデルに渡した順の {"doc_id", "text"} の並び）・
-    value（回答の値の欄）・unit（単位を別の欄にした場合だけ）。チャンクの区切り方は自由でよい。
+    実行記録は 1 行 1 問の JSON Lines。欄は id・chunks（回答モデルに渡した順のチャンクの並び）・
+    value（回答の値の欄）・unit（単位を別の欄にした場合だけ）。チャンクは {"doc_id", "text"} で書く
+    （区切り方は自由）。get_ja_data.py の区切り方なら、{"chunk_id": "S100G299#3"} と番号だけでもよい。
     """
-    import collections, json, random
+    import json, os
     company, qs = load_data(data_dir)
     byid = {x["id"]: x for x in qs}
     rows, unknown = [], 0
+    spans, texts = {}, {}
+
+    def text_of(c):
+        if "text" in c:
+            return c["text"]
+        if not spans:
+            with open(os.path.join(data_dir, "chunks.jsonl"), encoding="utf-8") as f:
+                for line in f:
+                    d = json.loads(line)
+                    spans[d["chunk_id"]] = (d["doc_id"], d["start"], d["end"])
+        doc_id, a, b = spans[c["chunk_id"]]
+        if doc_id not in texts:
+            path = os.path.join(data_dir, "text", f"{doc_id}.txt")
+            texts[doc_id] = open(path, encoding="utf-8", newline="").read()
+        return texts[doc_id][a:b]
+
+    def owner_of(c):
+        return c.get("edinet_code") or company.get(c.get("doc_id") or c.get("chunk_id", "").split("#")[0])
+
     with open(run_path, encoding="utf-8") as f:
         for line in f:
             if not line.strip():
@@ -461,9 +481,7 @@ def score(run_path, data_dir, out_path=None, n_boot=2000, seed=0):
                 continue
             firm, value, labels = target(x)
             ch = r.get("chunks") or []
-            rank = first_reach([c.get("text", "") for c in ch],
-                               [c.get("edinet_code") or company.get(c.get("doc_id")) for c in ch],
-                               firm, value, labels)
+            rank = first_reach([text_of(c) for c in ch], [owner_of(c) for c in ch], firm, value, labels)
             rows.append({"id": x["id"], "reach_rank": rank, "read": read(r.get("value"), value, r.get("unit"))})
     if not rows:
         print("採点できる記録がありません（id が JA-LOOKUP の設問と合っているか確かめてください）。")
