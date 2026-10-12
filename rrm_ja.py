@@ -170,10 +170,20 @@ def forms(value_yen):
         add(head + (f"{mil}百万" if mil else ""))
         if mil >= 10:
             add(head + f"{mil // 10}千" + (f"{mil % 10}百万" if mil % 10 else "万"))
-    if av >= 100_000_000:  # 丸めた億と兆（「2,459億円」「1.2兆円」）は項目名が要る
-        weak.add(f"{round(av / 1e8):,}億")
+    if av >= 100_000_000:  # 丸めた億と兆（「2,459億円」「1兆2,293億円」「1.2兆円」）は項目名が要る
+        n = round(av / 1e8)
+        weak.add(f"{n:,}億")
+        if n >= 10_000:
+            cho, oku = divmod(n, 10_000)
+            weak.add(f"{cho:,}兆{oku:,}億" if oku else f"{cho:,}兆")
     if av >= 1e12:
         weak.add(f"{av / 1e12:.1f}兆")
+    if av % 1_000_000 and av >= 1_000_000:  # 千円の値を百万円に丸めた表記（「2,136百万円」「21億36百万円」）
+        m = round(av / 1e6)
+        weak.add(f"{m:,}百万")
+        if m >= 100:
+            oku, mil = divmod(m, 100)
+            weak.add(f"{oku:,}億{mil}百万" if mil else f"{oku:,}億")
     return strong, weak
 
 
@@ -183,19 +193,32 @@ WELL = re.compile(r"\d{1,3}(?:,\d{3})*(?:\.\d+)?")  # 3 桁ごとにカンマを
 def _run(text, i, j):
     """text[i:j] を含む、数字とカンマ（と小数点）の連なりの範囲。"""
     p, q = i, j
-    while p > 0 and (text[p - 1].isdigit() or text[p - 1] == ","):
+    while p > 0 and (text[p - 1].isdigit() or text[p - 1] == ","
+                     or (text[p - 1] == "." and p > 1 and text[p - 2].isdigit())):
         p -= 1
     while q < len(text) and (text[q].isdigit() or (text[q] in ",." and q + 1 < len(text) and text[q + 1].isdigit())):
         q += 1
     return p, q
 
 
+def _splits(s):
+    """s を、正しい形の数値をいくつか並べたものとして読めるか（「2,616153」は「2,616」と「153」）。"""
+    ok = [True] + [False] * len(s)
+    for i in range(len(s)):
+        if ok[i]:
+            for j in range(i + 1, len(s) + 1):
+                if not ok[j] and WELL.fullmatch(s, i, j):
+                    ok[j] = True
+    return ok[len(s)]
+
+
 def _hits(text, form):
     """form が一つの数値として現れる場所。「1,245,896」や「13,018」の途中の表記は数えない。
 
     EDINET-Bench の表は列の区切りが消えていて、前期と当期が「396,925245,896」や「3843,018」とつながる。
+    株主資本等変動計算書や四半期の表では、三つ以上の列がつながる（「△2,616153259,269」）。
     数字の連なりが一つの正しい形の数値でなければ列がつながったものとみなし、
-    両側が正しい形の数値に切れる位置だけを切れ目として認める。
+    両側が正しい形の数値の並びとして読める位置だけを切れ目として認める。
     """
     i = text.find(form)
     while i >= 0:
@@ -208,7 +231,7 @@ def _hits(text, form):
         if not left and not right:
             yield i
         elif not WELL.fullmatch(whole) and not re.fullmatch(r"(?:19|20)\d\d", whole) \
-                and (not left or WELL.fullmatch(left)) and (not right or WELL.fullmatch(right)):
+                and (not left or _splits(left)) and (not right or _splits(right)):
             yield i
         i = text.find(form, i + 1)
 
@@ -300,6 +323,11 @@ def selftest():
         ("売上高※１ 10,377,898※1 12,109,488売上原価", 12_109_488_000, ["売上高"], True),
         ("営業活動によるキャッシュ・フローは、75億4千5百万円の収入", 7_545_000_000, ["営業活動によるキャッシュ・フロー"], True),
         ("営業活動によるキャッシュ・フローは、75億9千万円の収入", 7_545_000_000, ["営業活動によるキャッシュ・フロー"], False),
+        ("当期末残高2,770△2,616153259,269  ", 259_269_000, ["純資産合計"], True),         # 三つ以上の列
+        ("売上高849,19321.21,003,12425.0914,51422.81,238,65930.94,005,491営業利益", 4_005_491_000, ["売上高"], True),
+        ("(投資活動によるキャッシュ・フロー)投資活動による支出は1兆2,293億円となり", -1_229_280_000_000, L, True),
+        ("(投資活動によるキャッシュ・フロー) 投資活動の結果、減少した資金は2,136百万円であります", -2_136_401_000, L, True),
+        ("営業活動の結果、増加した資金は2,136百万円であります", -2_136_401_000, L, False),  # 項目名が無い
         ("財務活動によるキャッシュ　フロー 245,896", G, L, True),
     ]
     for text, v, labels, want in reach_cases:
@@ -371,7 +399,9 @@ def check(data_dir):
             elif i >= 0:
                 stats["other"] += 1
                 stats["other_same_doc"] += c["doc_id"] == loc["doc_id"]
-                examples.append((x["id"], c["doc_id"], c["section"], _norm(ch)[max(0, i - 45):i + 20]))
+                ev = x["gold"]["evidence"][0]
+                examples.append((x["id"], f"{ev['account']} {ev['printed']}{ev['unit']}", c["section"],
+                                 _norm(ch)[max(0, i - 45):i + 20]))
         stats["questions"] += 1
         stats["questions_flagged"] += gold_hit
     print(f"Reach: 設問 {stats['questions']} 問のうち、正解の位置を含むチャンクを正解の箇所と数えた設問 "
